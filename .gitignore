@@ -1,0 +1,5 @@
+outputs/
+dataset/
+*.pth
+__pycache__/
+.venv/
