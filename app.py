@@ -1,26 +1,13 @@
-"""Gradio web app for the Potato vs Onion image classifier.
-
-Run locally:
-    python app.py
-    python app.py --share          # create a temporary public link
-
-Configuration (environment variables, all optional):
-    MODEL_NAME          "mobilenet_v2" (default) or "cnn"
-    IMG_SIZE            Input resolution used in training (default 224)
-    CONFIDENCE_THRESHOLD  Minimum confidence to accept a prediction (default 0.85)
-    WEIGHTS_PATH        Explicit path to the trained .pth file
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
 import logging
 import os
 import sys
+import json
+import io
+import uvicorn
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
-import gradio as gr
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -48,43 +35,27 @@ WEIGHTS_CANDIDATES: tuple[Path, ...] = tuple(
     if p
 )
 CLASSES_FILE = Path("outputs/classes.json")
-EXAMPLES_DIR = Path("examples")
-OTHERS_LABEL = "others"
-
-DISPLAY_NAMES: dict[str, str] = {
-    "potatoes": "Potatoes",
-    "onions": "Onions",
-    "both": "Potatoes and onions",
-    "others": "Neither",
-}
-
-CSS = """
-.gradio-container {max-width: 960px !important; margin: auto;}
-#title {text-align: center;}
-#status {font-size: 1.15rem; padding: 12px 16px; border-radius: 10px;}
-footer {visibility: hidden;}
-"""
-
 
 class ModelLoadError(RuntimeError):
     """Raised when the trained model cannot be loaded."""
+
+#I nitialize the FastAPI app
+app = FastAPI(title="Potato vs Onion API")
+
+#Configure CORS so your HTML frontend can talk to this backend 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --------------------------------------------------------------------------- #
 # Model wrapper
 # --------------------------------------------------------------------------- #
 class Classifier:
-    """Loads the trained model once and serves predictions.
-
-    Args:
-        model_name: Architecture name understood by ``model.build_model``.
-        weights_candidates: Paths to try, in order, for the trained weights.
-        img_size: Input resolution (must match training).
-        threshold: Minimum confidence required to accept a prediction.
-
-    Raises:
-        ModelLoadError: If no weights file exists or the weights are invalid.
-    """
+    """Loads the trained model once and serves predictions."""
 
     def __init__(
         self,
@@ -150,119 +121,41 @@ class Classifier:
         scores = {name: float(p) for name, p in zip(self.class_names, probs)}
         return self.class_names[int(idx)], float(confidence), scores
 
+# 1. Load the model into memory so the API can use it
+try:
+    classifier = Classifier(MODEL_NAME, WEIGHTS_CANDIDATES, IMG_SIZE, CONFIDENCE_THRESHOLD)
+    logger.info("Model loaded successfully. Ready for API requests!")
+except ModelLoadError as exc:
+    logger.error("%s", exc)
+    sys.exit(1)
 
-# --------------------------------------------------------------------------- #
-# UI logic
-# --------------------------------------------------------------------------- #
-def format_result(top_class: str, confidence: float, threshold: float) -> str:
-    """Turn a raw prediction into a user-friendly status message."""
-    pct = confidence * 100
-    if top_class == OTHERS_LABEL:
-        return (
-            "### 🚫 No potatoes or onions detected\n"
-            "This looks like something else. Please upload a clear photo "
-            "of potatoes and/or onions."
-        )
-    if confidence < threshold:
-        return (
-            "### ⚠️ Not sure about this one\n"
-            f"The best guess was **{DISPLAY_NAMES.get(top_class, top_class)}** at "
-            f"only {pct:.1f}% confidence (required: {threshold * 100:.0f}%). "
-            "Try a brighter, closer photo with the vegetables clearly in view."
-        )
-    return (
-        f"### ✅ {DISPLAY_NAMES.get(top_class, top_class)}\n"
-        f"Confidence: **{pct:.1f}%**"
-    )
-
-
-def build_interface(classifier: Classifier) -> gr.Blocks:
-    """Create the Gradio Blocks interface around a loaded classifier."""
-
-    def run(image: Image.Image | None) -> tuple[str, dict[str, float]]:
-        """Gradio callback: classify an uploaded image."""
-        if image is None:
-            return "### 📷 Please upload an image first.", {}
-        try:
-            top_class, confidence, scores = classifier.predict(image)
-        except Exception:  # never crash the UI on a bad image
-            logger.exception("Prediction failed")
-            return "### ❌ Something went wrong processing that image. Please try another.", {}
-        return format_result(top_class, confidence, classifier.threshold), scores
-
-    with gr.Blocks(
-        title="Potato vs Onion Classifier",
-        theme=gr.themes.Soft(primary_hue="amber"),
-        css=CSS,
-    ) as demo:
-        gr.Markdown(
-            "# 🥔🧅 Potato vs Onion Classifier\n"
-            "Upload a photo and the model will tell you whether it contains "
-            "**potatoes**, **onions**, **both**, or **neither**.",
-            elem_id="title",
-        )
-
-        with gr.Row(equal_height=True):
-            with gr.Column():
-                image_in = gr.Image(type="pil", label="Your photo", height=360)
-                with gr.Row():
-                    clear_btn = gr.ClearButton(value="Clear")
-                    submit_btn = gr.Button("Classify", variant="primary")
-            with gr.Column():
-                status = gr.Markdown("### Waiting for an image…", elem_id="status")
-                probs_out = gr.Label(
-                    label="Class probabilities",
-                    num_top_classes=len(classifier.class_names),
-                )
-
-        example_files = (
-            sorted(str(p) for p in EXAMPLES_DIR.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-            if EXAMPLES_DIR.is_dir()
-            else []
-        )
-        if example_files:
-            gr.Examples(
-                examples=[[f] for f in example_files],
-                inputs=image_in,
-                outputs=[status, probs_out],
-                fn=run,
-                cache_examples=False,
-                label="Try an example",
-            )
-
-        with gr.Accordion("Tips for best results", open=False):
-            gr.Markdown(
-                "- Use a well-lit, in-focus photo with the vegetables filling most of the frame.\n"
-                "- Photos of other subjects (people, landscapes, other food) are reported as "
-                "*neither*.\n"
-                f"- Predictions below **{classifier.threshold * 100:.0f}%** confidence are "
-                "flagged as uncertain instead of guessed."
-            )
-
-        submit_btn.click(run, inputs=image_in, outputs=[status, probs_out])
-        image_in.upload(run, inputs=image_in, outputs=[status, probs_out])
-        clear_btn.add([image_in, status, probs_out])
-
-    return demo
-
-
-def main() -> None:
-    """Load the model and launch the web app."""
-    parser = argparse.ArgumentParser(description="Launch the Potato/Onion classifier web app.")
-    parser.add_argument("--share", action="store_true", help="Create a public Gradio link.")
-    parser.add_argument("--port", type=int, default=7860)
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
+# 2. Create the API Endpoint
+@app.post("/predict")
+async def predict_image(file: UploadFile = File(...)):
     try:
-        classifier = Classifier(MODEL_NAME, WEIGHTS_CANDIDATES, IMG_SIZE, CONFIDENCE_THRESHOLD)
-    except ModelLoadError as exc:
-        logger.error("%s", exc)
-        sys.exit(1)
-
-    build_interface(classifier).launch(share=args.share, server_port=args.port)
-
-
+        # Step A: Read the digital bytes of the uploaded image
+        image_bytes = await file.read()
+        
+        # Step B: Convert those bytes back into a real image format using 'io'
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Step C: Send the image to your existing PyTorch prediction function
+        top_class, confidence, scores = classifier.predict(image)
+        
+        # Step D: Send the final answer back to the frontend as JSON
+        return {
+            "class": top_class,
+            "confidence": round(confidence * 100, 2)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+# --------------------------------------------------------------------------- #
+# Main Execution / API Integration Setup
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logger.info("Starting the Backend API Server...")
+    
+    # Run the FastAPI server using Uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
