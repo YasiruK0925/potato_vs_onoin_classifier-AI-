@@ -241,8 +241,7 @@
     const onionScore = document.getElementById('onionScore');
     const onionBar = document.getElementById('onionBar');
 
-    // Backend configuration
-    const API_URL = 'http://127.0.0.1:8000/predict';
+    const API_URL = '/predict';
 
     let currentFile = null;
 
@@ -319,7 +318,7 @@
 
     // Render the prediction returned by the API
     function renderResult(predictedClass, confidence) {
-        const isPotato = predictedClass.trim().toLowerCase() === 'potato';
+        const isPotato = predictedClass.trim().toLowerCase().includes('potato');
         const conf = Math.min(Math.max(confidence, 0), 100);
         const inverse = (100 - conf).toFixed(1);
         const confText = conf.toFixed(1);

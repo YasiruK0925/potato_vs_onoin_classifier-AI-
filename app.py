@@ -7,6 +7,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
+from fastapi.responses import FileResponse
 
 import torch
 import torch.nn as nn
@@ -128,6 +129,9 @@ try:
 except ModelLoadError as exc:
     logger.error("%s", exc)
     sys.exit(1)
+@app.get("/")
+async def serve_home():
+    return FileResponse("frontend/potato_vs_onion_classifier.html")
 
 # 2. Create the API Endpoint
 @app.post("/predict")
@@ -142,6 +146,7 @@ async def predict_image(file: UploadFile = File(...)):
         # Step C: Send the image to your existing PyTorch prediction function
         top_class, confidence, scores = classifier.predict(image)
         
+        print(f"----> DEBUG: Model Predicted: {top_class} | Confidence: {confidence}")
         # Step D: Send the final answer back to the frontend as JSON
         return {
             "class": top_class,
