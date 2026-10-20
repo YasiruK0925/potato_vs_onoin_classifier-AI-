@@ -5,18 +5,18 @@ This module provides two interchangeable architectures:
 * :class:`PotatoOnionCNN` - a compact custom CNN trained from scratch, with
   BatchNorm after every convolution and Dropout before the linear layers.
 * :class:`PotatoOnionMobileNet` - a transfer-learning model built on a
-  pre-trained MobileNetV2 backbone with a new 4-class classifier head.
+  pre-trained MobileNetV2 backbone with a new 3-class classifier head.
 
 Use :func:`build_model` to create either one by name.
 
 Classes (index order must match your dataset's ``class_to_idx``):
-    0: both, 1: onions, 2: others, 3: potatoes
+    0: both, 1: onions, 2: potatoes
 
 Example:
     >>> model = build_model("mobilenet_v2", pretrained=True)
     >>> logits = model(torch.randn(8, 3, 224, 224))
     >>> logits.shape
-    torch.Size([8, 4])
+    torch.Size([8, 3])
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
-CLASS_NAMES: tuple[str, ...] = ("both", "onions", "others", "potatoes")
+CLASS_NAMES: tuple[str, ...] = ("both", "onions", "potatoes")
 NUM_CLASSES: int = len(CLASS_NAMES)
 
 ModelName = Literal["cnn", "mobilenet_v2"]
@@ -77,7 +77,7 @@ class ConvBlock(nn.Module):
 
 
 class PotatoOnionCNN(nn.Module):
-    """Custom CNN with BatchNorm and Dropout for 4-class classification.
+    """Custom CNN with BatchNorm and Dropout for 3-class classification.
 
     Architecture::
 

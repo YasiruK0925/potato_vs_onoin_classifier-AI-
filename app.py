@@ -17,7 +17,18 @@ from model import CLASS_NAMES, build_model
 from train_model import build_transforms  # same preprocessing as validation
 
 logger = logging.getLogger("app")
+from torchvision import transforms
 
+# Define the image preprocessing transform (matching your training settings)
+transform = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        ),
+    ]
+)
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -40,10 +51,10 @@ CLASSES_FILE = Path("outputs/classes.json")
 class ModelLoadError(RuntimeError):
     """Raised when the trained model cannot be loaded."""
 
-#I nitialize the FastAPI app
+# Initialize the FastAPI app
 app = FastAPI(title="Potato vs Onion API")
 
-#Configure CORS so your HTML frontend can talk to this backend 
+# Configure CORS so your HTML frontend can talk to this backend 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,31 +140,43 @@ try:
 except ModelLoadError as exc:
     logger.error("%s", exc)
     sys.exit(1)
+
 @app.get("/")
 async def serve_home():
-    return FileResponse("frontend/potato_vs_onion_classifier.html")
+    html_path = Path(__file__).parent / "frontend" / "potato_vs_onion_classifier_frontend.html"
+    return FileResponse(html_path)
 
 # 2. Create the API Endpoint
 @app.post("/predict")
 async def predict_image(file: UploadFile = File(...)):
     try:
-        # Step A: Read the digital bytes of the uploaded image
+        # 1. Read the uploaded image file and convert it to RGB format
         image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         
-        # Step B: Convert those bytes back into a real image format using 'io'
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Step C: Send the image to your existing PyTorch prediction function
-        top_class, confidence, scores = classifier.predict(image)
-        
-        print(f"----> DEBUG: Model Predicted: {top_class} | Confidence: {confidence}")
-        # Step D: Send the final answer back to the frontend as JSON
+        # 2. Use the Classifier wrapper to get prediction, confidence, and scores
+        class_name, confidence, scores = classifier.predict(image)
+
+        # 3. Check if the confidence score meets the threshold (75%)
+        CONFIDENCE_THRESHOLD = 0.75
+        if confidence < CONFIDENCE_THRESHOLD:
+            return {
+                "prediction": "Unknown",
+                "message": "Please upload a valid image of a potato, onion, or both.",
+                "confidence": f"{confidence * 100:.2f}%",
+                "probabilities": scores
+            }
+
+        # 4. Return the successful classification result if the threshold is met
         return {
-            "class": top_class,
-            "confidence": round(confidence * 100, 2)
+            "prediction": class_name,
+            "confidence": f"{confidence * 100:.2f}%",
+            "probabilities": scores
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as exc:
+        logger.error("Error during prediction: %s", exc)
+        return {"error": str(exc)}
+
 # --------------------------------------------------------------------------- #
 # Main Execution / API Integration Setup
 # --------------------------------------------------------------------------- #
