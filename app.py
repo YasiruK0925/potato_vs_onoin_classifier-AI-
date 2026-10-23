@@ -1,60 +1,55 @@
+import io
+import json
 import logging
 import os
 import sys
-import json
-import io
-import uvicorn
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from fastapi.responses import FileResponse
 
 import torch
 import torch.nn as nn
+import uvicorn
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
 
 from model import CLASS_NAMES, build_model
 from train_model import build_transforms  # same preprocessing as validation
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("app")
-from torchvision import transforms
 
-# Define the image preprocessing transform (matching your training settings)
-transform = transforms.Compose(
-    [
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        ),
-    ]
-)
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 MODEL_NAME: str = os.getenv("MODEL_NAME", "mobilenet_v2")
 IMG_SIZE: int = int(os.getenv("IMG_SIZE", "224"))
-CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.85"))
+# Predictions below this confidence (0-1) are reported as "Unknown".
+CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
 
 # The first existing path wins.
 WEIGHTS_CANDIDATES: tuple[Path, ...] = tuple(
     Path(p)
     for p in (
         os.getenv("WEIGHTS_PATH", ""),
-        "outputs/best_model.pth",    
+        "outputs/best_model.pth",
         "potato_onion_model.pth",
     )
     if p
 )
 CLASSES_FILE = Path("outputs/classes.json")
+FRONTEND_FILE = Path(__file__).parent / "frontend" / "potato_vs_onion_classifier_frontend.html"
+
 
 class ModelLoadError(RuntimeError):
     """Raised when the trained model cannot be loaded."""
 
-# Initialize the FastAPI app
+
+# --------------------------------------------------------------------------- #
+# FastAPI app
+# --------------------------------------------------------------------------- #
 app = FastAPI(title="Potato vs Onion API")
 
-# Configure CORS so your HTML frontend can talk to this backend 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -133,7 +128,8 @@ class Classifier:
         scores = {name: float(p) for name, p in zip(self.class_names, probs)}
         return self.class_names[int(idx)], float(confidence), scores
 
-# 1. Load the model into memory so the API can use it
+
+# Load the model into memory once at startup
 try:
     classifier = Classifier(MODEL_NAME, WEIGHTS_CANDIDATES, IMG_SIZE, CONFIDENCE_THRESHOLD)
     logger.info("Model loaded successfully. Ready for API requests!")
@@ -141,49 +137,47 @@ except ModelLoadError as exc:
     logger.error("%s", exc)
     sys.exit(1)
 
+
+# --------------------------------------------------------------------------- #
+# Routes
+# --------------------------------------------------------------------------- #
 @app.get("/")
 async def serve_home():
-    html_path = Path(__file__).parent / "frontend" / "potato_vs_onion_classifier_frontend.html"
-    return FileResponse(html_path)
+    return FileResponse(FRONTEND_FILE)
 
-# 2. Create the API Endpoint
+
 @app.post("/predict")
 async def predict_image(file: UploadFile = File(...)):
     try:
-        # 1. Read the uploaded image file and convert it to RGB format
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        # 2. Use the Classifier wrapper to get prediction, confidence, and scores
+
         class_name, confidence, scores = classifier.predict(image)
 
-        # 3. Check if the confidence score meets the threshold (75%)
-        CONFIDENCE_THRESHOLD = 0.75
-        if confidence < CONFIDENCE_THRESHOLD:
-            return {
-                "prediction": "Unknown",
-                "message": "Please upload a valid image of a potato, onion, or both.",
-                "confidence": f"{confidence * 100:.2f}%",
-                "probabilities": scores
-            }
+        is_unknown = confidence < classifier.threshold
+        label = "Unknown" if is_unknown else class_name
 
-        # 4. Return the successful classification result if the threshold is met
         return {
-            "prediction": class_name,
-            "confidence": f"{confidence * 100:.2f}%",
-            "probabilities": scores
+            "class": label,                                   # key the frontend reads
+            "prediction": label,                              # kept for compatibility
+            "confidence": round(confidence * 100, 2),         # number, 0-100
+            "probabilities": {k: round(v * 100, 2) for k, v in scores.items()},  # 0-100
+            "top_class": class_name,
+            "is_unknown": is_unknown,
+            "message": (
+                "Please upload a valid image of a potato or an onion."
+                if is_unknown
+                else "OK"
+            ),
         }
     except Exception as exc:
-        logger.error("Error during prediction: %s", exc)
-        return {"error": str(exc)}
+        logger.exception("Error during prediction")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
 
 # --------------------------------------------------------------------------- #
-# Main Execution / API Integration Setup
+# Main
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    import uvicorn
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logger.info("Starting the Backend API Server...")
-    
-    # Run the FastAPI server using Uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
