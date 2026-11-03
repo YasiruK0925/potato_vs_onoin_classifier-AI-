@@ -28,7 +28,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    p = argparse.ArgumentParser(description="Classify an image as potatoes/onions/both/others.")
+    p = argparse.ArgumentParser(description="Classify an image as onions or potatoes.")
     p.add_argument("--image", type=Path, required=True, help="Path to the image to classify.")
     p.add_argument("--weights", type=Path, default=Path("outputs/best_model.pth"),
                    help="Path to the trained weights (.pth).")
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
                    help="JSON file with class names saved during training.")
     p.add_argument("--model", choices=["cnn", "mobilenet_v2"], default="mobilenet_v2")
     p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--top-k", type=int, default=4,
+    p.add_argument("--top-k", type=int, default=2,
                    help="Number of top predictions to show (1 = top prediction only).")
     return p.parse_args()
 

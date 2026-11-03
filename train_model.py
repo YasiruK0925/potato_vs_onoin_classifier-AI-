@@ -1,11 +1,9 @@
-"""Train the Potato vs Onion image classifier.
+"""Train the Potato vs Onion image classifier (2-Class Setup).
 
 Expected dataset layout (ImageFolder style)::
 
     dataset/
-        both/       *.jpg
         onions/     *.jpg
-        others/     *.jpg
         potatoes/   *.jpg
 
 Example:
@@ -30,14 +28,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler, random_split
 from torchvision import datasets, transforms
 
-from model import CLASS_NAMES, NUM_CLASSES, build_model, count_parameters
+from model import build_model, count_parameters
 
 logger = logging.getLogger("train")
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-
-MINORITY_CLASS = "both"  # class that receives oversampling + heavier augmentation
 
 
 # --------------------------------------------------------------------------- #
@@ -126,56 +122,13 @@ def build_transforms(img_size: int) -> tuple[transforms.Compose, transforms.Comp
     return train_tf, val_tf
 
 
-def build_minority_transform(img_size: int) -> transforms.Compose:
-    """Heavier augmentation pipeline used only for the minority class.
-
-    Because the sampler shows these few images many times per epoch, each
-    repeat is warped strongly so the model rarely sees the same pixels twice.
-    """
-    return transforms.Compose([
-        transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0), ratio=(0.75, 1.33)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(45),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=10),
-        transforms.RandomPerspective(distortion_scale=0.3, p=0.4),
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
-        transforms.RandomGrayscale(p=0.05),
-        transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.3),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.15)),
-    ])
-
-
-class MinorityAugImageFolder(datasets.ImageFolder):
-    """``ImageFolder`` that applies a heavier transform to one target class."""
-
-    def __init__(self, root, transform, minority_transform, minority_idx: int):
-        super().__init__(root, transform=transform)
-        self.minority_transform = minority_transform
-        self.minority_idx = minority_idx
-
-    def __getitem__(self, index: int):
-        path, target = self.samples[index]
-        image = self.loader(path)
-        tf = self.minority_transform if target == self.minority_idx else self.transform
-        return tf(image), target
-
-
 def build_sampler(
     train_view: datasets.ImageFolder,
     train_indices: list[int],
     num_classes: int,
     seed: int,
 ) -> WeightedRandomSampler:
-    """Create a ``WeightedRandomSampler`` with inverse-class-frequency weights.
-
-    Weights are computed from the *training split only*. Each sample gets
-    ``1 / count[its class]``, so every class is drawn about equally often and
-    the minority class ("both") is sampled far more frequently than its raw
-    share of the data.
-    """
+    """Create a ``WeightedRandomSampler`` with inverse-class-frequency weights."""
     train_targets = [train_view.targets[i] for i in train_indices]
     counts = Counter(train_targets)
     class_weights = {c: 1.0 / counts[c] for c in counts}
@@ -194,36 +147,18 @@ def build_sampler(
 
 
 def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, list[str]]:
-    """Split the dataset 80/20 with ``random_split`` and build the loaders.
-
-    ``random_split`` returns Subsets that share one underlying dataset, which
-    would force the same transform on both splits. To give the training split
-    augmentation and the validation split plain preprocessing, we create two
-    ``ImageFolder`` views of the same folder and apply the *same* split
-    indices to each.
-
-    The training loader uses a ``WeightedRandomSampler`` to oversample the
-    minority class, and the training view applies heavier augmentation to it.
-    """
+    """Split the dataset 80/20 and build data loaders for 2 classes."""
     train_tf, val_tf = build_transforms(args.img_size)
 
-    # Class list is needed first to locate the minority class index.
+    # Load dataset to inspect classes dynamically
     val_view = datasets.ImageFolder(args.data_dir, transform=val_tf)
     classes = val_view.classes
     logger.info("Classes detected: %s", classes)
-    if len(classes) != NUM_CLASSES:
-        raise ValueError(f"Expected {NUM_CLASSES} classes, found {len(classes)}: {classes}")
-    if tuple(classes) != CLASS_NAMES:
-        logger.warning("Class order %s differs from model.CLASS_NAMES %s", classes, CLASS_NAMES)
-    if MINORITY_CLASS not in classes:
-        raise ValueError(f"Minority class '{MINORITY_CLASS}' not found in {classes}")
+    
+    if len(classes) < 2:
+        raise ValueError(f"Expected at least 2 classes in '{args.data_dir}', found {len(classes)}: {classes}")
 
-    train_view = MinorityAugImageFolder(
-        args.data_dir,
-        transform=train_tf,
-        minority_transform=build_minority_transform(args.img_size),
-        minority_idx=classes.index(MINORITY_CLASS),
-    )
+    train_view = datasets.ImageFolder(args.data_dir, transform=train_tf)
 
     n_total = len(train_view)
     n_val = int(n_total * args.val_split)
@@ -241,7 +176,6 @@ def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader,
     sampler = build_sampler(train_view, train_indices, len(classes), args.seed)
 
     pin = torch.cuda.is_available()
-    # shuffle must stay unset (False) when a sampler is provided.
     train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=sampler,
                               num_workers=args.num_workers, pin_memory=pin)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
@@ -259,14 +193,7 @@ def run_epoch(
     device: torch.device,
     optimizer: optim.Optimizer | None = None,
 ) -> tuple[float, float]:
-    """Run one pass over ``loader``.
-
-    If ``optimizer`` is given the model is trained; otherwise it is evaluated
-    without gradient tracking.
-
-    Returns:
-        ``(average_loss, accuracy_percent)`` over the whole loader.
-    """
+    """Run one pass over ``loader``."""
     training = optimizer is not None
     model.train(training)
     total_loss, correct, total = 0.0, 0, 0
@@ -323,7 +250,6 @@ def main() -> None:
     logger.info("Starting training for %d epochs...", args.epochs)
     start = time.time()
     for epoch in range(1, args.epochs + 1):
-        # Optionally unfreeze the MobileNet backbone after the warm-up epochs.
         if args.model == "mobilenet_v2" and args.freeze_epochs and epoch == args.freeze_epochs + 1:
             model.unfreeze_backbone()
             logger.info("Backbone unfrozen: trainable parameters now %s", f"{count_parameters(model):,}")
@@ -339,7 +265,7 @@ def main() -> None:
         improved = val_acc > best_val_acc
         if improved:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), best_path)  # weights only, best epoch only
+            torch.save(model.state_dict(), best_path)
 
         logger.info(
             "Epoch [%02d/%d] train loss %.4f acc %.2f%% | val loss %.4f acc %.2f%% | "

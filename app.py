@@ -24,6 +24,8 @@ logger = logging.getLogger("app")
 # --------------------------------------------------------------------------- #
 MODEL_NAME: str = os.getenv("MODEL_NAME", "mobilenet_v2")
 IMG_SIZE: int = int(os.getenv("IMG_SIZE", "224"))
+# This API serves a two-class model: potato vs. onion.
+NUM_CLASSES: int = 2
 # Predictions below this confidence (0-1) are reported as "Unknown".
 CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
 
@@ -79,13 +81,30 @@ class Classifier:
 
     @staticmethod
     def _load_class_names() -> list[str]:
-        """Read class names saved by training, falling back to defaults."""
+        """Read class names saved by training, falling back to defaults.
+
+        The result must contain exactly ``NUM_CLASSES`` (two) classes.
+        """
+        names: list[str] | None = None
+        source = "model.CLASS_NAMES"
+
         if CLASSES_FILE.is_file():
             try:
-                return list(json.loads(CLASSES_FILE.read_text()))
+                names = list(json.loads(CLASSES_FILE.read_text()))
+                source = str(CLASSES_FILE)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Could not read %s (%s); using defaults.", CLASSES_FILE, exc)
-        return list(CLASS_NAMES)
+
+        if names is None:
+            names = list(CLASS_NAMES)
+
+        if len(names) != NUM_CLASSES:
+            raise ModelLoadError(
+                f"Expected {NUM_CLASSES} classes (potato and onion) but {source} "
+                f"contains {len(names)}: {names}. Re-run train_model.py on the "
+                f"two-class dataset to regenerate it."
+            )
+        return names
 
     def _load_model(self, name: str, candidates: tuple[Path, ...]) -> nn.Module:
         """Build the architecture and load the first available weights file."""
@@ -94,19 +113,19 @@ class Classifier:
             searched = ", ".join(f"'{p}'" for p in candidates)
             raise ModelLoadError(
                 f"No trained weights found (looked for: {searched}). "
-                "Train a model with train_model.py or set WEIGHTS_PATH."
+                "Train a two-class model with train_model.py or set WEIGHTS_PATH."
             )
 
         kwargs = {"pretrained": False} if name == "mobilenet_v2" else {}
-        model = build_model(name, num_classes=len(self.class_names), **kwargs)
+        model = build_model(name, num_classes=NUM_CLASSES, **kwargs)
         try:
             state = torch.load(weights, map_location=self.device, weights_only=True)
             model.load_state_dict(state)
         except RuntimeError as exc:
             raise ModelLoadError(
                 f"'{weights}' does not match MODEL_NAME='{name}' with "
-                f"{len(self.class_names)} classes. Weights from an older "
-                f"3-class model must be retrained.\n{exc}"
+                f"{NUM_CLASSES} classes. The weights must come from a two-class "
+                f"(potato vs. onion) model; otherwise retrain with train_model.py.\n{exc}"
             ) from exc
         except Exception as exc:
             raise ModelLoadError(f"Could not load weights from '{weights}': {exc}") from exc
@@ -120,7 +139,7 @@ class Classifier:
 
         Returns:
             ``(top_class, confidence, probabilities)`` where ``probabilities``
-            maps every class name to its probability in [0, 1].
+            maps both class names to their probability in [0, 1].
         """
         batch = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
         probs = torch.softmax(self.model(batch), dim=1).squeeze(0).cpu()
