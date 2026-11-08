@@ -1,0 +1,36 @@
+# Version control
+.git
+.gitignore
+
+# Python virtual environments and caches
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter / training artifacts
+.ipynb_checkpoints/
+*.ipynb
+data/
+datasets/
+runs/
+logs/
+*.log
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker files themselves
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Local secrets
+.env

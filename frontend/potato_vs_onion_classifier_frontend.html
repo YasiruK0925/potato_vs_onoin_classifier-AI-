@@ -31,10 +31,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        body { font-family: 'Inter', sans-serif; }
-        .transition-all-300 { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
-    </style>
+    
 </head>
 <body class="h-full bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col justify-between transition-colors duration-300">
 
@@ -47,7 +44,7 @@
                 </div>
                 <div>
                     <h1 class="font-bold text-lg tracking-tight bg-gradient-to-r from-amber-600 to-orange-500 bg-clip-text text-transparent">AgriVision AI</h1>
-                    <p class="text-xs text-slate-500 dark:text-slate-400">Potato vs Onion Neural Classifier</p>
+                    <p class="text-xs text-slate-500 dark:text-slate-400">Potato vs Onion AI Classifier</p>
                 </div>
             </div>
             <div class="flex items-center space-x-3">
@@ -62,16 +59,6 @@
 
     <!-- Main Content Container -->
     <main class="flex-grow max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
-
-        <!-- Hero Section -->
-        <div class="text-center max-w-2xl mx-auto mb-10">
-            <span class="inline-flex items-center space-x-1.5 py-1 px-3 rounded-full text-xs font-semibold bg-orange-100 dark:bg-orange-950/60 text-orange-700 dark:text-orange-300 mb-4 border border-orange-200 dark:border-orange-900">
-                <i class="fa-solid fa-wand-magic-sparkles"></i>
-                <span>Powered by MobileNetV2 Transfer Learning</span>
-            </span>
-            <h2 class="text-3xl sm:text-4xl font-extrabold tracking-tight mb-3">Classify Produce Instantly</h2>
-            <p class="text-slate-600 dark:text-slate-400 text-sm sm:text-base">Upload or drag and drop an image of a potato or an onion below to get real-time AI classification scores and analysis.</p>
-        </div>
 
         <!-- App Grid Layout -->
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
@@ -114,7 +101,7 @@
                     </div>
                     <button id="classifyBtn" disabled class="w-full sm:w-auto px-6 py-3.5 rounded-xl bg-orange-600 hover:bg-orange-700 disabled:bg-slate-200 dark:disabled:bg-slate-800 disabled:text-slate-400 dark:disabled:text-slate-600 text-white font-semibold shadow-lg shadow-orange-600/20 disabled:shadow-none transition-all-300 flex items-center justify-center space-x-2 cursor-pointer disabled:cursor-not-allowed">
                         <i class="fa-solid fa-microchip"></i>
-                        <span>Classify Produce</span>
+                        <span>Check</span>
                     </button>
                 </div>
             </div>
@@ -198,15 +185,6 @@
                         </div>
                     </div>
                 </div>
-
-                <!-- Footer status inside card -->
-                <div class="mt-8 pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-400">
-                    <span>Model: MobileNetV2 (PyTorch)</span>
-                    <span class="flex items-center space-x-1 text-emerald-500 font-medium">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 inline-block animate-ping"></span>
-                        <span>API Ready</span>
-                    </span>
-                </div>
             </div>
 
         </div>
@@ -249,7 +227,12 @@
 
     let currentFile = null;
 
-    // Theme Toggle functionality
+   // 1. Check the user's device OS default theme on page load
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.classList.add('dark');
+    }
+
+    // 2. Theme Toggle functionality (Manual button)
     themeToggle.addEventListener('click', () => {
         document.documentElement.classList.toggle('dark');
     });
