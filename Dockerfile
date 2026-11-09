@@ -23,12 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install dependencies first to leverage Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir python-multipart 
 
 # Copy source code, frontend, and model weights
 COPY app.py .
 COPY model.py .
-COPY potato_onion_model.pth .
+COPY train_model.py .
 COPY frontend/ ./frontend/
+COPY outputs/ ./outputs/
 
 # Run as a non-root user for security
 RUN useradd --create-home appuser && chown -R appuser:appuser /app
