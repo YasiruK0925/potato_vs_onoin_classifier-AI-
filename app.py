@@ -16,10 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader
-from torchvision import datasets, models, transforms
+from torchvision import models, transforms
 
 from model import CLASS_NAMES, build_model
-from train_model import build_transforms  # same preprocessing as validation
+from train_model import MultiLabelImageDataset, build_transforms, describe_labels
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("app")
@@ -30,19 +30,27 @@ logger = logging.getLogger("app")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "mobilenet_v2")
 IMG_SIZE: int = int(os.getenv("IMG_SIZE", "224"))
 NUM_CLASSES: int = 2
-CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
+# Multi-label decision rule: a class is "detected" when its sigmoid probability is above this.
+DETECTION_THRESHOLD: float = float(os.getenv("DETECTION_THRESHOLD", "0.5"))
 
 WEIGHTS_CANDIDATES: tuple[Path, ...] = tuple(
     Path(p)
     for p in (
         os.getenv("WEIGHTS_PATH", ""),
         "outputs/best_model.pth",
-        "potato_onion_model.pth",
     )
     if p
 )
 CLASSES_FILE = Path("outputs/classes.json")
 FRONTEND_FILE = Path(__file__).parent / "frontend" / "potato_vs_onion_classifier_frontend.html"
+
+# Friendly singular names used in the "detected" list.
+DISPLAY_NAMES = {"onions": "onion", "potatoes": "potato"}
+
+
+def display_name(name: str) -> str:
+    return DISPLAY_NAMES.get(name, name)
+
 
 # --- Stage 1: color / pixel heuristics (0-255 pixel scale) -------------------
 COLOR_FILTER_ENABLED: bool = os.getenv("COLOR_FILTER_ENABLED", "1") == "1"
@@ -81,14 +89,16 @@ GATEKEEPER_ALLOWED_LABELS: set[str] = {
     # grocery / kitchen context in which potatoes & onions are commonly photographed
     "grocery store", "shopping basket", "plastic bag", "mixing bowl", "soup bowl", "plate", "pot",
     "frying pan", "wok", "crock pot", "caldron", "wooden spoon", "carton", "crate", "bucket", "hamper",
-    "tray", "butcher shop", "wheelbarrow",
+    "tray", "butcher shop",
 }
 
 # --- Stage 3: feature-space anomaly check (needs one-time calibration) --------
 FEATURE_CHECK_ENABLED: bool = os.getenv("FEATURE_CHECK_ENABLED", "1") == "1"
 FEATURE_STATS_FILE = Path(os.getenv("FEATURE_STATS_FILE", "outputs/feature_stats.json"))
-# Reject if distance to the predicted class centroid > MULT * (99th percentile of training distances).
+# Reject if the distance to the NEAREST known label-combination centroid is greater than
+# MULT * (99th percentile of the training distances for that combination).
 FEATURE_DIST_MULT: float = float(os.getenv("FEATURE_DIST_MULT", "1.5"))
+FEATURE_STATS_VERSION = 2
 
 
 class ModelLoadError(RuntimeError):
@@ -156,11 +166,9 @@ class Classifier:
     @staticmethod
     def _load_class_names() -> list[str]:
         names: list[str] | None = None
-        source = "model.CLASS_NAMES"
         if CLASSES_FILE.is_file():
             try:
                 names = list(json.loads(CLASSES_FILE.read_text()))
-                source = str(CLASSES_FILE)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Could not read %s (%s); using defaults.", CLASSES_FILE, exc)
         if names is None:
@@ -172,11 +180,18 @@ class Classifier:
     def _load_model(self, name: str, candidates: tuple[Path, ...]) -> nn.Module:
         weights = next((p for p in candidates if p.is_file()), None)
         if weights is None:
-            raise ModelLoadError("No trained weights found.")
+            raise ModelLoadError(f"No trained weights found. Looked in: {[str(p) for p in candidates]}")
+        logger.info("Loading weights from %s", weights.resolve())
         kwargs = {"pretrained": False} if name == "mobilenet_v2" else {}
         model = build_model(name, num_classes=NUM_CLASSES, **kwargs)
         state = torch.load(weights, map_location=self.device, weights_only=True)
-        model.load_state_dict(state)
+        try:
+            model.load_state_dict(state)
+        except RuntimeError as exc:
+            raise ModelLoadError(
+                f"{weights} does not match architecture '{name}' (keys look like {list(state)[:4]}). "
+                "Train with train_model.py or point WEIGHTS_PATH at the right file."
+            ) from exc
         return model.to(self.device).eval()
 
     def _register_feature_hook(self) -> None:
@@ -231,15 +246,19 @@ class Classifier:
     def _load_feature_stats(self) -> dict[str, Any] | None:
         if not FEATURE_STATS_FILE.is_file():
             logger.warning(
-                "%s not found: feature anomaly check is INACTIVE. Run `python app.py --calibrate <train_dir>` once.",
+                "%s not found: feature anomaly check is INACTIVE. Run `python app.py --calibrate <data_dir>` once.",
                 FEATURE_STATS_FILE,
             )
             return None
         try:
             raw = json.loads(FEATURE_STATS_FILE.read_text())
+            if raw.get("version") != FEATURE_STATS_VERSION:
+                logger.warning("%s is from an older single-label model; feature anomaly check INACTIVE. "
+                               "Re-run `python app.py --calibrate <data_dir>`.", FEATURE_STATS_FILE)
+                return None
             return {
-                "centroids": np.asarray(raw["centroids"], dtype=np.float32),
-                "p99": np.asarray(raw["p99"], dtype=np.float32),
+                "centroids": np.asarray(raw["centroids"], dtype=np.float32),  # (groups, feature_dim)
+                "p99": np.asarray(raw["p99"], dtype=np.float32),              # (groups,)
             }
         except (json.JSONDecodeError, KeyError, OSError, ValueError) as exc:
             logger.warning("Could not read %s (%s); feature anomaly check inactive.", FEATURE_STATS_FILE, exc)
@@ -247,25 +266,27 @@ class Classifier:
 
     # ----------------------------- inference -------------------------------- #
     @torch.no_grad()
-    def _forward(self, image: Image.Image) -> tuple[str, int, float, dict[str, float], np.ndarray | None]:
+    def _forward(self, image: Image.Image) -> tuple[dict[str, float], np.ndarray | None]:
+        """Run the custom model. Returns independent sigmoid probabilities per class (0.0 - 1.0)
+        and the penultimate feature vector."""
         batch = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
         self._features = None
-        probs = torch.softmax(self.model(batch), dim=1).squeeze(0).cpu()
-        confidence, idx = probs.max(dim=0)
+        probs = torch.sigmoid(self.model(batch)).squeeze(0).cpu()  # sigmoid, NOT softmax
         scores = {name: float(p) for name, p in zip(self.class_names, probs)}
         feats = None
         if self._features is not None:
             feats = self._features.flatten(start_dim=1)[0].cpu().numpy()
-        return self.class_names[int(idx)], int(idx), float(confidence), scores, feats
+        return scores, feats
 
-    def predict(self, image: Image.Image) -> tuple[str, float, dict[str, float]]:
-        """Raw custom-model prediction (no validation pipeline)."""
-        name, _idx, confidence, scores, _feats = self._forward(image)
-        return name, confidence, scores
+    def predict(self, image: Image.Image) -> dict[str, float]:
+        """Raw custom-model probabilities per class (no validation pipeline)."""
+        scores, _feats = self._forward(image)
+        return scores
 
     @torch.no_grad()
     def _gatekeeper_check(self, image: Image.Image) -> tuple[bool, str, float]:
-        """Returns (passed, top ImageNet label, probability mass on acceptable classes)."""
+        """Returns (passed, top ImageNet label, probability mass on acceptable classes).
+        ImageNet is a single-label model, so softmax is correct here."""
         assert self.gatekeeper is not None
         batch = self.gk_transform(image.convert("RGB")).unsqueeze(0).to(self.device)
         probs = torch.softmax(self.gatekeeper(batch), dim=1).squeeze(0).cpu()
@@ -274,17 +295,22 @@ class Classifier:
         passed = top_idx in self.gk_allowed_set or food_mass >= GATEKEEPER_MIN_FOOD_MASS
         return passed, self.gk_categories[top_idx], food_mass
 
-    def _feature_anomaly(self, feats: np.ndarray | None, class_idx: int) -> tuple[bool, float, float]:
-        """Returns (is_anomalous, distance, limit). Inactive (False) when not calibrated."""
+    def _feature_anomaly(self, feats: np.ndarray | None) -> tuple[bool, float, float]:
+        """Returns (is_anomalous, distance, limit) measured against the NEAREST known label combination
+        (onion only / potato only / both). Inactive (False) when not calibrated."""
         if self.feature_stats is None or feats is None:
             return False, 0.0, 0.0
-        centroid = self.feature_stats["centroids"][class_idx]
-        limit = float(self.feature_stats["p99"][class_idx]) * FEATURE_DIST_MULT
-        dist = float(np.linalg.norm(feats - centroid))
-        return (not np.isfinite(dist)) or dist > limit, dist, limit
+        if not np.isfinite(feats).all():
+            return True, float("inf"), 0.0
+        limits = self.feature_stats["p99"] * FEATURE_DIST_MULT
+        dists = np.linalg.norm(self.feature_stats["centroids"] - feats[None, :], axis=1)
+        ratios = dists / np.maximum(limits, 1e-8)
+        best = int(ratios.argmin())
+        return bool(ratios[best] > 1.0), float(dists[best]), float(limits[best])
 
     # ----------------------------- pipeline --------------------------------- #
     def _reject(self, stage: str, message: str) -> dict[str, Any]:
+        """Early rejection (model never ran): nothing detected."""
         logger.info("Rejected at %s: %s", stage, message)
         return {
             "class": "Unknown",
@@ -292,13 +318,41 @@ class Classifier:
             "confidence": 0.0,
             "probabilities": {name: 0.0 for name in self.class_names},
             "top_class": "Unknown",
+            "detected": [],
+            "detections": [],
             "is_unknown": True,
             "message": message,
             "rejected_by": stage,
         }
 
+    def _response(self, scores: dict[str, float], detected: list[str], message: str,
+                  rejected_by: str | None) -> dict[str, Any]:
+        """Build the JSON payload from real model scores.
+
+        ``detected`` holds the class names to report (empty -> nothing detected / unknown).
+        Legacy fields (class, prediction, confidence, probabilities, top_class, is_unknown, message)
+        are kept so the existing frontend does not break; ``detected`` and ``detections`` are new.
+        """
+        top_name = max(scores, key=scores.get)
+        detections = [
+            {"name": display_name(n), "confidence": round(scores[n] * 100, 2)} for n in detected
+        ]
+        label = " + ".join(detected) if detected else "Unknown"
+        return {
+            "class": label,
+            "prediction": label,
+            "confidence": round(scores[top_name] * 100, 2),
+            "probabilities": {k: round(v * 100, 2) for k, v in scores.items()},
+            "top_class": top_name,
+            "detected": [d["name"] for d in detections],   # e.g. ["potato", "onion"]
+            "detections": detections,                       # e.g. [{"name": "potato", "confidence": 97.31}, ...]
+            "is_unknown": not detected,
+            "message": message,
+            "rejected_by": rejected_by,
+        }
+
     def analyze(self, image: Image.Image) -> dict[str, Any]:
-        """Defense-in-depth validation + classification. Returns the frontend JSON payload."""
+        """Defense-in-depth validation + multi-label classification. Returns the frontend JSON payload."""
         # 1) color / pixel heuristics
         if COLOR_FILTER_ENABLED:
             reason = check_color_heuristics(image)
@@ -307,7 +361,7 @@ class Classifier:
 
         # 2) pre-trained ImageNet gatekeeper
         if self.gatekeeper is not None:
-            passed, top_label, food_mass = self._gatekeeper_check(image)
+            passed, top_label, _food_mass = self._gatekeeper_check(image)
             if not passed:
                 return self._reject(
                     "gatekeeper",
@@ -315,56 +369,44 @@ class Classifier:
                 )
 
         # Custom model forward pass (also yields penultimate features via hook)
-        class_name, class_idx, confidence, scores, feats = self._forward(image)
-        probabilities = {k: round(v * 100, 2) for k, v in scores.items()}
+        scores, feats = self._forward(image)
 
         # 3) feature-space anomaly check
         if FEATURE_CHECK_ENABLED:
-            anomalous, dist, limit = self._feature_anomaly(feats, class_idx)
+            anomalous, dist, limit = self._feature_anomaly(feats)
             if anomalous:
                 logger.info("Feature anomaly: distance %.3f > limit %.3f", dist, limit)
-                return {
-                    "class": "Unknown",
-                    "prediction": "Unknown",
-                    "confidence": round(confidence * 100, 2),
-                    "probabilities": probabilities,
-                    "top_class": class_name,
-                    "is_unknown": True,
-                    "message": "Image rejected by feature anomaly check: image looks unlike any potato or onion "
-                               "the model was trained on.",
-                    "rejected_by": "feature_anomaly",
-                }
+                return self._response(
+                    scores, [],
+                    "Image rejected by feature anomaly check: image looks unlike any potato or onion "
+                    "the model was trained on.",
+                    "feature_anomaly",
+                )
 
-        # 4) strict confidence threshold (final verdict)
-        is_unknown = confidence < self.threshold
-        label = "Unknown" if is_unknown else class_name
-        return {
-            "class": label,
-            "prediction": label,
-            "confidence": round(confidence * 100, 2),
-            "probabilities": probabilities,
-            "top_class": class_name,
-            "is_unknown": is_unknown,
-            "message": "Please upload a valid image of a potato or an onion." if is_unknown else "OK",
-            "rejected_by": "confidence_threshold" if is_unknown else None,
-        }
+        # 4) multi-label verdict: every class is judged independently (no argmax)
+        detected = [
+            name for name, p in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            if p > self.threshold
+        ]
+        if not detected:
+            return self._response(
+                scores, [], "Please upload a valid image of a potato or an onion.", "confidence_threshold"
+            )
+        return self._response(scores, detected, "OK", None)
 
     # ----------------------------- calibration ------------------------------ #
     @torch.no_grad()
-    def calibrate_features(self, data_dir: str, out_path: Path = FEATURE_STATS_FILE, max_per_class: int = 1000) -> None:
-        """Compute per-class feature centroids + 99th-percentile distances from your EXISTING training
-        images (ImageFolder layout: data_dir/<class_name>/*.jpg). No new data is needed."""
-        dataset = datasets.ImageFolder(data_dir, transform=self.transform)
-        folder_names = [c.lower() for c in dataset.classes]
-        model_names = [c.lower() for c in self.class_names]
-        if sorted(folder_names) == sorted(model_names):
-            to_model_idx = {i: model_names.index(n) for i, n in enumerate(folder_names)}
-        else:
-            logger.warning("Folder classes %s differ from model classes %s; assuming same order.",
-                           dataset.classes, self.class_names)
-            to_model_idx = {i: i for i in range(len(dataset.classes))}
+    def calibrate_features(self, data_dir: str, out_path: Path = FEATURE_STATS_FILE,
+                           min_group_size: int = 5, max_per_group: int = 1000) -> None:
+        """Compute feature centroids + 99th-percentile distances from your EXISTING training data
+        (data_dir/labels.csv + data_dir/all_images/). Images are grouped by label combination
+        (onion only, potato only, both); images with no label are ignored. No new data is needed."""
+        data_dir = Path(data_dir)
+        dataset = MultiLabelImageDataset(
+            data_dir / "labels.csv", data_dir / "all_images", self.class_names, transform=self.transform
+        )
 
-        per_class: list[list[np.ndarray]] = [[] for _ in range(NUM_CLASSES)]
+        groups: dict[tuple[int, ...], list[np.ndarray]] = {}
         for images, labels in DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0):
             self._features = None
             self.model(images.to(self.device))
@@ -372,28 +414,43 @@ class Classifier:
                 raise RuntimeError("Feature hook did not fire; cannot calibrate.")
             feats = self._features.flatten(start_dim=1).cpu().numpy()
             for f, lab in zip(feats, labels.tolist()):
-                bucket = per_class[to_model_idx[lab]]
-                if len(bucket) < max_per_class:
+                key = tuple(int(v > 0.5) for v in lab)
+                if not any(key):
+                    continue  # "neither" images are negatives, not part of the normal distribution
+                bucket = groups.setdefault(key, [])
+                if len(bucket) < max_per_group:
                     bucket.append(f)
 
-        centroids, p99s = [], []
-        for ci, bucket in enumerate(per_class):
-            if not bucket:
-                raise RuntimeError(f"No calibration images found for class '{self.class_names[ci]}'.")
+        names, centroids, p99s = [], [], []
+        for key, bucket in sorted(groups.items()):
+            group_name = describe_labels(tuple(float(v) for v in key), self.class_names)
+            if len(bucket) < min_group_size:
+                logger.warning("Skipping '%s': only %d image(s) (need >= %d).", group_name, len(bucket), min_group_size)
+                continue
             arr = np.stack(bucket)
             centroid = arr.mean(axis=0)
             dists = np.linalg.norm(arr - centroid, axis=1)
+            names.append(group_name)
             centroids.append(centroid.tolist())
             p99s.append(float(np.percentile(dists, 99)))
-            logger.info("%s: n=%d, mean dist=%.3f, p99=%.3f", self.class_names[ci], len(arr), dists.mean(), p99s[-1])
+            logger.info("%s: n=%d, mean dist=%.3f, p99=%.3f", group_name, len(arr), dists.mean(), p99s[-1])
+
+        if not centroids:
+            raise RuntimeError("No label group had enough images to calibrate.")
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps({"class_names": self.class_names, "centroids": centroids, "p99": p99s}))
+        out_path.write_text(json.dumps({
+            "version": FEATURE_STATS_VERSION,
+            "class_names": self.class_names,
+            "groups": names,
+            "centroids": centroids,
+            "p99": p99s,
+        }))
         logger.info("Saved feature statistics to %s. Restart the server to activate the anomaly check.", out_path)
 
 
 try:
-    classifier = Classifier(MODEL_NAME, WEIGHTS_CANDIDATES, IMG_SIZE, CONFIDENCE_THRESHOLD)
+    classifier = Classifier(MODEL_NAME, WEIGHTS_CANDIDATES, IMG_SIZE, DETECTION_THRESHOLD)
 except ModelLoadError as exc:
     logger.error("%s", exc)
     sys.exit(1)
@@ -419,8 +476,8 @@ async def predict_image(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--calibrate", metavar="TRAIN_DIR",
-                        help="Build outputs/feature_stats.json from existing training images and exit.")
+    parser.add_argument("--calibrate", metavar="DATA_DIR",
+                        help="Build outputs/feature_stats.json from DATA_DIR/labels.csv + DATA_DIR/all_images and exit.")
     args = parser.parse_args()
     if args.calibrate:
         classifier.calibrate_features(args.calibrate)

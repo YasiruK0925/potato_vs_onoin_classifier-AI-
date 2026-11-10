@@ -1,10 +1,24 @@
-"""Train the Potato vs Onion image classifier (2-Class Setup).
+"""Train the Potato vs Onion image classifier (Multi-Label Setup).
 
-Expected dataset layout (ImageFolder style)::
+An image can contain a potato, an onion, both, or neither. Each class is
+predicted independently (sigmoid outputs + BCEWithLogitsLoss).
+
+Expected dataset layout::
 
     dataset/
-        onions/     *.jpg
-        potatoes/   *.jpg
+        labels.csv          # columns: filename, potato_flag, onion_flag
+        all_images/         # every image in one flat folder
+            img_001.jpg
+            img_002.jpg
+            ...
+
+Example ``labels.csv``::
+
+    filename,potato_flag,onion_flag
+    img_001.jpg,1,0
+    img_002.jpg,0,1
+    img_003.jpg,1,1
+    img_004.jpg,0,0
 
 Example:
     python train_model.py --data-dir ./dataset --model mobilenet_v2 --epochs 25
@@ -14,26 +28,34 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import random
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler, random_split
-from torchvision import datasets, transforms
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler, random_split
+from torchvision import transforms
 
-from model import build_model, count_parameters
+from model import CLASS_NAMES, build_model, count_parameters
 
 logger = logging.getLogger("train")
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# Which CSV column feeds which output class. Label vectors are always returned
+# in CLASS_NAMES order (onions, potatoes), regardless of the CSV column order.
+CSV_FILENAME_COLUMN = "filename"
+CSV_LABEL_COLUMNS = {"onions": "onion_flag", "potatoes": "potato_flag"}
 
 
 # --------------------------------------------------------------------------- #
@@ -41,8 +63,12 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    p = argparse.ArgumentParser(description="Train the Potato/Onion classifier.")
+    p = argparse.ArgumentParser(description="Train the Potato/Onion multi-label classifier.")
     p.add_argument("--data-dir", type=Path, default=Path("./dataset"))
+    p.add_argument("--labels-csv", type=Path, default=None,
+                   help="Path to labels.csv (default: <data-dir>/labels.csv).")
+    p.add_argument("--image-dir", type=Path, default=None,
+                   help="Folder holding all images (default: <data-dir>/all_images).")
     p.add_argument("--output-dir", type=Path, default=Path("./outputs"))
     p.add_argument("--model", choices=["cnn", "mobilenet_v2"], default="mobilenet_v2")
     p.add_argument("--epochs", type=int, default=25)
@@ -99,6 +125,93 @@ def get_device() -> torch.device:
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
+class MultiLabelImageDataset(Dataset):
+    """Dataset that reads images and multi-hot labels from a CSV file.
+
+    The CSV needs the columns ``filename``, ``potato_flag`` and ``onion_flag``
+    (flags are 0 or 1). Images are loaded from a single flat ``image_dir``.
+
+    Each item is ``(image_tensor, label_tensor)`` where ``label_tensor`` is a
+    ``torch.float32`` vector in ``class_names`` order, e.g. ``tensor([1., 1.])``
+    for an image containing both an onion and a potato.
+
+    Args:
+        csv_path: Path to ``labels.csv``.
+        image_dir: Directory containing all images named in the CSV.
+        class_names: Output class order (defaults to ``model.CLASS_NAMES``).
+        transform: Optional transform applied to the PIL image.
+    """
+
+    def __init__(
+        self,
+        csv_path: Path,
+        image_dir: Path,
+        class_names: Sequence[str] = CLASS_NAMES,
+        transform: Callable | None = None,
+    ) -> None:
+        self.transform = transform
+        self.class_names = list(class_names)
+
+        try:
+            label_columns = [CSV_LABEL_COLUMNS[name] for name in self.class_names]
+        except KeyError as exc:
+            raise ValueError(f"No CSV column configured for class {exc}. "
+                             f"Update CSV_LABEL_COLUMNS in train_model.py.") from exc
+
+        if not Path(csv_path).is_file():
+            raise FileNotFoundError(f"Labels file not found: {csv_path}")
+        if not Path(image_dir).is_dir():
+            raise FileNotFoundError(f"Image directory not found: {image_dir}")
+
+        samples: list[tuple[Path, tuple[float, ...]]] = []
+        missing = 0
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"{csv_path} is empty.")
+            reader.fieldnames = [h.strip() for h in reader.fieldnames]
+            required = [CSV_FILENAME_COLUMN, *label_columns]
+            absent = [c for c in required if c not in reader.fieldnames]
+            if absent:
+                raise ValueError(f"{csv_path} is missing column(s) {absent}. Found: {reader.fieldnames}")
+
+            for line_no, row in enumerate(reader, start=2):
+                filename = (row[CSV_FILENAME_COLUMN] or "").strip()
+                if not filename:
+                    continue
+                path = Path(image_dir) / filename
+                if not path.is_file():
+                    missing += 1
+                    continue
+                try:
+                    label = tuple(float(row[c]) for c in label_columns)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{csv_path} line {line_no}: flags must be 0 or 1.") from exc
+                if any(v not in (0.0, 1.0) for v in label):
+                    raise ValueError(f"{csv_path} line {line_no}: flags must be 0 or 1, got {label}.")
+                samples.append((path, label))
+
+        if missing:
+            logger.warning("%d image(s) listed in %s were not found in %s and were skipped.",
+                           missing, csv_path, image_dir)
+        if not samples:
+            raise ValueError(f"No usable images found via {csv_path} in {image_dir}.")
+
+        self.samples = samples
+        self.targets: list[tuple[float, ...]] = [label for _, label in samples]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        path, label = self.samples[index]
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, torch.tensor(label, dtype=torch.float32)
+
+
 def build_transforms(img_size: int) -> tuple[transforms.Compose, transforms.Compose]:
     """Create (train, validation) transform pipelines.
 
@@ -122,21 +235,31 @@ def build_transforms(img_size: int) -> tuple[transforms.Compose, transforms.Comp
     return train_tf, val_tf
 
 
+def describe_labels(label: tuple[float, ...], class_names: Sequence[str]) -> str:
+    """Human-readable name for a multi-hot label, e.g. 'onions+potatoes' or 'neither'."""
+    present = [name for name, v in zip(class_names, label) if v > 0.5]
+    return "+".join(present) if present else "neither"
+
+
 def build_sampler(
-    train_view: datasets.ImageFolder,
+    train_view: MultiLabelImageDataset,
     train_indices: list[int],
-    num_classes: int,
+    class_names: Sequence[str],
     seed: int,
 ) -> WeightedRandomSampler:
-    """Create a ``WeightedRandomSampler`` with inverse-class-frequency weights."""
-    train_targets = [train_view.targets[i] for i in train_indices]
-    counts = Counter(train_targets)
-    class_weights = {c: 1.0 / counts[c] for c in counts}
-    sample_weights = torch.tensor([class_weights[t] for t in train_targets], dtype=torch.double)
+    """Create a ``WeightedRandomSampler`` balancing every label combination.
+
+    With multi-label data there is no single class per image, so images are
+    grouped by their exact label combination (onion only, potato only, both,
+    neither) and weighted by inverse group frequency.
+    """
+    keys = [train_view.targets[i] for i in train_indices]
+    counts = Counter(keys)
+    sample_weights = torch.tensor([1.0 / counts[k] for k in keys], dtype=torch.double)
 
     logger.info(
-        "Train class counts: %s",
-        {train_view.classes[c]: counts.get(c, 0) for c in range(num_classes)},
+        "Train label combinations: %s",
+        {describe_labels(k, class_names): n for k, n in sorted(counts.items(), reverse=True)},
     )
     return WeightedRandomSampler(
         weights=sample_weights,
@@ -147,18 +270,16 @@ def build_sampler(
 
 
 def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, list[str]]:
-    """Split the dataset 80/20 and build data loaders for 2 classes."""
+    """Split the dataset 80/20 and build data loaders for the multi-label task."""
     train_tf, val_tf = build_transforms(args.img_size)
 
-    # Load dataset to inspect classes dynamically
-    val_view = datasets.ImageFolder(args.data_dir, transform=val_tf)
-    classes = val_view.classes
-    logger.info("Classes detected: %s", classes)
-    
-    if len(classes) < 2:
-        raise ValueError(f"Expected at least 2 classes in '{args.data_dir}', found {len(classes)}: {classes}")
+    csv_path = args.labels_csv or (args.data_dir / "labels.csv")
+    image_dir = args.image_dir or (args.data_dir / "all_images")
+    classes = list(CLASS_NAMES)
+    logger.info("Classes (output order): %s | labels: %s | images: %s", classes, csv_path, image_dir)
 
-    train_view = datasets.ImageFolder(args.data_dir, transform=train_tf)
+    train_view = MultiLabelImageDataset(csv_path, image_dir, classes, transform=train_tf)
+    val_view = MultiLabelImageDataset(csv_path, image_dir, classes, transform=val_tf)
 
     n_total = len(train_view)
     n_val = int(n_total * args.val_split)
@@ -173,7 +294,7 @@ def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader,
     val_set = Subset(val_view, list(split[1]))
     logger.info("Dataset: %d images -> %d train / %d validation", n_total, n_train, n_val)
 
-    sampler = build_sampler(train_view, train_indices, len(classes), args.seed)
+    sampler = build_sampler(train_view, train_indices, classes, args.seed)
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=sampler,
@@ -193,7 +314,12 @@ def run_epoch(
     device: torch.device,
     optimizer: optim.Optimizer | None = None,
 ) -> tuple[float, float]:
-    """Run one pass over ``loader``."""
+    """Run one pass over ``loader``.
+
+    Returns:
+        ``(mean_loss, exact_match_accuracy_percent)``. An image counts as
+        correct only if EVERY label (onion and potato) matches the ground truth.
+    """
     training = optimizer is not None
     model.train(training)
     total_loss, correct, total = 0.0, 0, 0
@@ -201,7 +327,7 @@ def run_epoch(
     with torch.set_grad_enabled(training):
         for inputs, labels in loader:
             inputs = inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)  # float32, shape (N, num_classes)
 
             if training:
                 optimizer.zero_grad()
@@ -212,7 +338,8 @@ def run_epoch(
                 optimizer.step()
 
             total_loss += loss.item() * inputs.size(0)
-            correct += (outputs.argmax(dim=1) == labels).sum().item()
+            preds = torch.sigmoid(outputs) > 0.5
+            correct += (preds == (labels > 0.5)).all(dim=1).sum().item()
             total += inputs.size(0)
 
     return total_loss / total, 100.0 * correct / total
@@ -236,7 +363,7 @@ def main() -> None:
     model = build_model(args.model, num_classes=len(classes), **model_kwargs).to(device)
     logger.info("Model: %s | trainable parameters: %s", args.model, f"{count_parameters(model):,}")
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
@@ -276,7 +403,7 @@ def main() -> None:
         )
 
     (args.output_dir / "history.json").write_text(json.dumps(history, indent=2))
-    logger.info("Finished in %.1f min. Best validation accuracy: %.2f%%",
+    logger.info("Finished in %.1f min. Best validation exact-match accuracy: %.2f%%",
                 (time.time() - start) / 60, best_val_acc)
     logger.info("Best weights saved to '%s'", best_path)
 

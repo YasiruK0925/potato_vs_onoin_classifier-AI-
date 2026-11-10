@@ -1,15 +1,22 @@
-"""Model definitions for the Potato vs Onion image classifier.
+"""Model definitions for the Potato vs Onion image classifier (multi-label).
 
 This module provides two interchangeable architectures:
 
 * :class:`PotatoOnionCNN` - a compact custom CNN trained from scratch, with
   BatchNorm after every convolution and Dropout before the linear layers.
 * :class:`PotatoOnionMobileNet` - a transfer-learning model built on a
-  pre-trained MobileNetV2 backbone with a new 2-class classifier head.
+  pre-trained MobileNetV2 backbone with a new classifier head.
 
 Use :func:`build_model` to create either one by name.
 
-Classes (index order must match your dataset's ``class_to_idx``):
+Multi-label setup:
+    Each output logit is an INDEPENDENT yes/no question ("is there an onion?",
+    "is there a potato?"). An image can therefore contain both, either, or
+    neither. Train with ``nn.BCEWithLogitsLoss`` and turn logits into
+    probabilities with ``torch.sigmoid`` (NOT softmax). See
+    :func:`predict_multilabel`.
+
+Classes (output index order; the training dataset returns labels in this order):
     0: onions, 1: potatoes
 
 Example:
@@ -17,6 +24,7 @@ Example:
     >>> logits = model(torch.randn(8, 3, 224, 224))
     >>> logits.shape
     torch.Size([8, 2])
+    >>> probs, present = predict_multilabel(logits)
 """
 
 from __future__ import annotations
@@ -29,8 +37,31 @@ from torchvision import models
 
 CLASS_NAMES: tuple[str, ...] = ("onions", "potatoes")
 NUM_CLASSES: int = len(CLASS_NAMES)
+DEFAULT_THRESHOLD: float = 0.5
 
 ModelName = Literal["cnn", "mobilenet_v2"]
+
+
+# --------------------------------------------------------------------------- #
+# Inference helper
+# --------------------------------------------------------------------------- #
+def predict_multilabel(
+    logits: torch.Tensor,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert raw logits into independent per-class probabilities and decisions.
+
+    Args:
+        logits: Raw model output of shape ``(N, num_classes)``.
+        threshold: A class counts as present when its probability is above this.
+
+    Returns:
+        ``(probabilities, present)`` where ``probabilities`` is a float tensor
+        in ``[0, 1]`` and ``present`` is a bool tensor, both ``(N, num_classes)``.
+        The probabilities do NOT sum to 1 - each class is scored on its own.
+    """
+    probs = torch.sigmoid(logits)
+    return probs, probs > threshold
 
 
 # --------------------------------------------------------------------------- #
@@ -77,7 +108,7 @@ class ConvBlock(nn.Module):
 
 
 class PotatoOnionCNN(nn.Module):
-    """Custom CNN with BatchNorm and Dropout for 2-class classification.
+    """Custom CNN with BatchNorm and Dropout for multi-label classification.
 
     Architecture::
 
@@ -89,7 +120,7 @@ class PotatoOnionCNN(nn.Module):
     required.
 
     Args:
-        num_classes: Number of output classes.
+        num_classes: Number of output labels (one independent logit each).
         in_channels: Number of input image channels (3 for RGB).
         channels: Output channels of each convolutional block.
         hidden_dim: Width of the hidden fully-connected layer.
@@ -141,15 +172,15 @@ class PotatoOnionCNN(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute class logits.
+        """Compute per-class logits.
 
         Args:
             x: Input batch of shape ``(N, C, H, W)``.
 
         Returns:
             Raw (un-normalised) logits of shape ``(N, num_classes)``. Apply
-            ``softmax`` for probabilities; ``nn.CrossEntropyLoss`` expects
-            logits directly.
+            ``sigmoid`` for independent probabilities; ``nn.BCEWithLogitsLoss``
+            expects logits directly.
         """
         x = self.features(x)
         x = self.pool(x)
@@ -160,10 +191,10 @@ class PotatoOnionCNN(nn.Module):
 # Option 2: transfer learning with MobileNetV2
 # --------------------------------------------------------------------------- #
 class PotatoOnionMobileNet(nn.Module):
-    """MobileNetV2 transfer-learning model with a new classification head.
+    """MobileNetV2 transfer-learning model with a new multi-label head.
 
     Args:
-        num_classes: Number of output classes.
+        num_classes: Number of output labels (one independent logit each).
         pretrained: If ``True``, load ImageNet-pretrained weights
             (downloaded on first use).
         freeze_backbone: If ``True``, freeze all feature-extractor weights so
@@ -207,7 +238,7 @@ class PotatoOnionMobileNet(nn.Module):
             param.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute class logits.
+        """Compute per-class logits.
 
         Args:
             x: Input batch of shape ``(N, 3, H, W)`` (224x224 recommended).
@@ -231,7 +262,7 @@ def build_model(
     Args:
         name: ``"cnn"`` for :class:`PotatoOnionCNN` or ``"mobilenet_v2"`` for
             :class:`PotatoOnionMobileNet`.
-        num_classes: Number of output classes.
+        num_classes: Number of output labels.
         **kwargs: Extra keyword arguments forwarded to the model constructor
             (e.g. ``pretrained=False``, ``dropout=0.3``).
 
@@ -271,5 +302,7 @@ if __name__ == "__main__":
         net.eval()
         with torch.no_grad():
             out = net(dummy)
+            probs, present = predict_multilabel(out)
         print(f"{model_name}: output {tuple(out.shape)}, "
-              f"trainable params {count_parameters(net):,}")
+              f"trainable params {count_parameters(net):,}, "
+              f"probs range [{probs.min():.2f}, {probs.max():.2f}]")

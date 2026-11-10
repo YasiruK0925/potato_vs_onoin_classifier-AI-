@@ -34,3 +34,9 @@ docker-compose*.yml
 
 # Local secrets
 .env
+
+#Temporary dataset sorting folders
+dataset/potatoes/
+dataset/onions/
+dataset/both/
+make_csv.py 
