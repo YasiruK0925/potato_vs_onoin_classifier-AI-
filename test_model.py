@@ -37,11 +37,18 @@ def display_name(name: str) -> str:
     """Singular display name for a class (falls back to the class name itself)."""
     return DISPLAY_NAMES.get(name, name)
 
+def get_default_image() -> Path:
+    """Automatically find an existing test_image file with any supported extension."""
+    for ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+        candidate = Path(f"test_image{ext}")
+        if candidate.is_file():
+            return candidate
+    return Path("test_image.jpg")  # Fallback if none found
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     p = argparse.ArgumentParser(description="Detect potatoes and/or onions in an image.")
-    p.add_argument("--image", type=Path, required=True, help="Path to the image to classify.")
+    p.add_argument("--image", type=Path, default=get_default_image(), help="Path to the image to classify.")
     p.add_argument("--weights", type=Path, default=Path("outputs/best_model.pth"),
                    help="Path to the trained weights (.pth).")
     p.add_argument("--classes-file", type=Path, default=Path("outputs/classes.json"),
