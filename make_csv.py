@@ -11,7 +11,9 @@ Run from the folder that contains ``dataset/``:
 import csv
 import shutil
 from pathlib import Path
+from PLT import Image
 
+ALLOWED_EXTENSIONS ={".jpg",".jpeg",".png",".webp",".bmp"}
 DATASET_DIR = Path("dataset")
 OUTPUT_DIR = DATASET_DIR / "all_images"
 CSV_PATH = DATASET_DIR / "labels.csv"
@@ -49,7 +51,7 @@ def main() -> None:
         for folder_name, (potato, onion) in FOLDERS.items():
             images = sorted(
                 p for p in (DATASET_DIR / folder_name).iterdir()
-                if p.is_file() and p.suffix.lower() == ".jpg"
+                if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
             )
             print(f"\nFound {len(images)} .jpg image(s) in '{folder_name}' -> labels potato={potato}, onion={onion}")
 

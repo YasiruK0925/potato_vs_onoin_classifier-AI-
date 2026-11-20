@@ -72,17 +72,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=Path("./outputs"))
     p.add_argument("--model", choices=["cnn", "mobilenet_v2"], default="mobilenet_v2")
     p.add_argument("--epochs", type=int, default=25)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--weight-decay", type=float, default=3e-4)
+    p.add_argument("--img-size", type=int, default=226)
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--freeze-epochs",
         type=int,
-        default=0,
+        default=3,
         help="(mobilenet_v2 only) train only the new head for this many epochs.",
     )
     p.add_argument("--no-pretrained", action="store_true",
@@ -268,9 +268,33 @@ def build_sampler(
         generator=torch.Generator().manual_seed(seed),
     )
 
+#Validation split added by me.
+def stratified_split_indices(
+    targets: list[tuple[float, ...]],
+    val_split: float,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    rng = random.Random(seed)
+    grouped: dict[tuple[float, ...], list[int]] = {}
+    for idx, label in enumerate(targets):
+        grouped.setdefault(label, []).append(idx)
+
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    for idxs in grouped.values():
+        shuffled = idxs[:]
+        rng.shuffle(shuffled)
+        n_val = max(1, int(round(len(shuffled) * val_split))) if len(shuffled) > 1 else 0
+        val_idx.extend(shuffled[:n_val])
+        train_idx.extend(shuffled[n_val:])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return train_idx, val_idx
+
 
 def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, list[str]]:
-    """Split the dataset 80/20 and build data loaders for the multi-label task."""
+    """Split the dataset and build data loaders for the multi-label task."""
     train_tf, val_tf = build_transforms(args.img_size)
 
     csv_path = args.labels_csv or (args.data_dir / "labels.csv")
@@ -281,29 +305,42 @@ def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader,
     train_view = MultiLabelImageDataset(csv_path, image_dir, classes, transform=train_tf)
     val_view = MultiLabelImageDataset(csv_path, image_dir, classes, transform=val_tf)
 
-    n_total = len(train_view)
-    n_val = int(n_total * args.val_split)
-    n_train = n_total - n_val
-    split = random_split(
-        range(n_total),
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_indices, val_indices = stratified_split_indices(
+        train_view.targets,
+        args.val_split,
+        args.seed,
     )
-    train_indices = list(split[0])
+    n_total = len(train_view)
+    n_train = len(train_indices)
+    n_val = len(val_indices)
+
     train_set = Subset(train_view, train_indices)
-    val_set = Subset(val_view, list(split[1]))
+    val_set = Subset(val_view, val_indices)
     logger.info("Dataset: %d images -> %d train / %d validation", n_total, n_train, n_val)
 
     sampler = build_sampler(train_view, train_indices, classes, args.seed)
 
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=sampler,
-                              num_workers=args.num_workers, pin_memory=pin)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=pin)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+    )
     return train_loader, val_loader, classes
 
-
+def smooth_labels(labels: torch.Tensor, smoothing: float = 0.02) -> torch.Tensor:
+    if smoothing <= 0.0:
+        return labels
+    return labels * (1.0 - smoothing) + 0.5 * smoothing
 # --------------------------------------------------------------------------- #
 # Train / evaluate
 # --------------------------------------------------------------------------- #
@@ -313,37 +350,65 @@ def run_epoch(
     criterion: nn.Module,
     device: torch.device,
     optimizer: optim.Optimizer | None = None,
-) -> tuple[float, float]:
-    """Run one pass over ``loader``.
-
-    Returns:
-        ``(mean_loss, exact_match_accuracy_percent)``. An image counts as
-        correct only if EVERY label (onion and potato) matches the ground truth.
-    """
+) -> tuple[float, float, list[float]]:
     training = optimizer is not None
     model.train(training)
-    total_loss, correct, total = 0.0, 0, 0
+    total_loss, exact_correct, total = 0.0, 0, 0
+    num_classes = None
+    per_class_correct = None
 
     with torch.set_grad_enabled(training):
         for inputs, labels in loader:
             inputs = inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)  # float32, shape (N, num_classes)
+            labels = labels.to(device, non_blocking=True)
+
+            if per_class_correct is None:
+                num_classes = labels.shape[1]
+                per_class_correct = torch.zeros(num_classes, device=device, dtype=torch.long)
 
             if training:
                 optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            targets_for_loss = smooth_labels(labels, smoothing=0.02) if training else labels
+            loss = criterion(outputs, targets_for_loss)
             if training:
                 loss.backward()
                 optimizer.step()
 
             total_loss += loss.item() * inputs.size(0)
             preds = torch.sigmoid(outputs) > 0.5
-            correct += (preds == (labels > 0.5)).all(dim=1).sum().item()
+            truth = labels > 0.5
+            exact_correct += (preds == truth).all(dim=1).sum().item()
+            per_class_correct += (preds == truth).sum(dim=0)
             total += inputs.size(0)
 
-    return total_loss / total, 100.0 * correct / total
+    per_class_acc = [100.0 * c.item() / total for c in per_class_correct]
+    return total_loss / total, 100.0 * exact_correct / total, per_class_acc
 
+@torch.no_grad()
+def find_best_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float]:
+    model.eval()
+    all_probs, all_targets = [], []
+    for inputs, labels in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        probs = torch.sigmoid(model(inputs)).cpu()
+        all_probs.append(probs)
+        all_targets.append(labels > 0.5)
+
+    probs_cat = torch.cat(all_probs, dim=0)
+    targets_cat = torch.cat(all_targets, dim=0)
+
+    best_t, best_acc = 0.5, 0.0
+    for i in range(30, 71):  # 0.30 to 0.70
+        t = i / 100.0
+        acc = ((probs_cat > t) == targets_cat).all(dim=1).float().mean().item() * 100.0
+        if acc > best_acc:
+            best_acc, best_t = acc, t
+    return best_t, best_acc
 
 def main() -> None:
     """Entry point: build data/model, train, checkpoint the best model."""
@@ -364,8 +429,8 @@ def main() -> None:
     logger.info("Model: %s | trainable parameters: %s", args.model, f"{count_parameters(model):,}")
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.7, patience=5)
 
     best_path = args.output_dir / "best_model.pth"
     (args.output_dir / "classes.json").write_text(json.dumps(classes))
@@ -376,6 +441,10 @@ def main() -> None:
 
     logger.info("Starting training for %d epochs...", args.epochs)
     start = time.time()
+
+    patience_es = 10
+    epochs_without_improve = 0
+    
     for epoch in range(1, args.epochs + 1):
         if args.model == "mobilenet_v2" and args.freeze_epochs and epoch == args.freeze_epochs + 1:
             model.unfreeze_backbone()
@@ -392,8 +461,16 @@ def main() -> None:
         improved = val_acc > best_val_acc
         if improved:
             best_val_acc = val_acc
+            epochs_without_improve = 0
             torch.save(model.state_dict(), best_path)
+        else:
+            epochs_without_improve += 1
 
+        # ... logger.info(...) ...
+
+        if epochs_without_improve >= patience_es:
+            logger.info("Early stopping triggered after %d epochs without val_acc improvement.", patience_es)
+            break
         logger.info(
             "Epoch [%02d/%d] train loss %.4f acc %.2f%% | val loss %.4f acc %.2f%% | "
             "lr %.2e | %.1fs%s",
@@ -407,6 +484,15 @@ def main() -> None:
                 (time.time() - start) / 60, best_val_acc)
     logger.info("Best weights saved to '%s'", best_path)
 
+    train_loss, train_acc, train_cls = run_epoch(model, train_loader, criterion, device, optimizer)
+    val_loss, val_acc, val_cls = run_epoch(model, val_loader, criterion, device)
+    scheduler.step(val_acc)
+
+    if best_path.is_file():
+        model.load_state_dict(torch.load(best_path, map_location=device))
+        best_t, tuned_acc = find_best_threshold(model, val_loader, device)
+        logger.info("Tuned threshold %.2f -> val exact-match accuracy: %.2f%%", best_t, tuned_acc)
 
 if __name__ == "__main__":
     main()
+    
